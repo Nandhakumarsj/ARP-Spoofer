@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# https://github.com/NandhakumarSJ/Arp-Spoofer
+# https://github.com/NandhakumarSJ/ARP-Spoofer
 
 __author__ = 'NandhakumarSJ @ keybase.io/nandhakumarsj'
 

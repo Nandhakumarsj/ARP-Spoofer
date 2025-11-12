@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # Windows-compatible replacement for packets.py
-# Based on EONRaider/Arp-Spoofer original with AF_PACKET removed
 # Requires: scapy (for get_if_hwaddr and getmacbyip) and running with Npcap+Administrator for active queries
 
 __author__ = 'Adapted from EONRaider'
@@ -79,9 +78,10 @@ class ARPSetupProxy(object):
 
     def __init__(self, interface: str, attacker_mac: str, gateway_mac: str,
                  gateway_ip: str, target_mac: str, target_ip: str,
-                 disassociate: bool):
+                 disassociate: bool, stealth: bool = False):
         self.__target_ip = target_ip
         self.__disassociate = disassociate
+        self.__stealth = stealth
         self.__net_tables = NetworkingTables()
         self.__gateway_route = self.__get_gateway_route()
         self.interface = self.__set_interface(interface)
@@ -180,6 +180,9 @@ class ARPSetupProxy(object):
             return mac_addr
         if self.__disassociate is True:
             return self.__randomize_mac_addr()
+        if self.__stealth is True:
+            # Use legitimate vendor prefix to avoid MAC vendor detection
+            return self.__generate_legitimate_mac()
         # Use scapy's get_if_hwaddr as a cross-platform way to obtain interface MAC
         try:
             # conf.iface can be set later; ensure we pass the interface string
@@ -192,6 +195,42 @@ class ARPSetupProxy(object):
     def __randomize_mac_addr() -> str:
         hex_values = '0123456789ABCDEF'
         return ':'.join(''.join(choices(hex_values, k=2)) for _ in range(6))
+
+    @staticmethod
+    def __generate_legitimate_mac() -> str:
+        """
+        Generate MAC address with legitimate vendor prefix (OUI) to avoid detection.
+        Uses common, widely-deployed vendor OUIs that won't raise suspicion.
+        """
+        # Common legitimate vendor OUIs (first 3 octets) - widely used, won't stand out
+        legitimate_ouis = [
+            '00:1B:21',  # Intel Corporation
+            '00:1E:67',  # Intel Corporation
+            '00:23:DF',  # Apple, Inc.
+            '00:25:00',  # Apple, Inc.
+            '00:E0:4C',  # Realtek Semiconductor
+            '00:1E:13',  # Cisco Systems
+            '00:1B:0D',  # Cisco Systems
+            '00:50:56',  # VMware, Inc.
+            '08:00:27',  # PCS Systemtechnik GmbH (VirtualBox)
+            '00:0C:29',  # VMware, Inc.
+            '00:15:5D',  # Microsoft Corporation
+            '00:1D:7D',  # Dell Inc.
+            '00:21:70',  # Hewlett Packard
+            '00:26:BB',  # Apple, Inc.
+            '00:50:56',  # VMware, Inc.
+        ]
+        oui = choices(legitimate_ouis)[0]
+        # Generate random last 3 octets (local administered bit should be 0 for unicast)
+        hex_values = '0123456789ABCDEF'
+        last_three = ':'.join(''.join(choices(hex_values, k=2)) for _ in range(3))
+        # Ensure first octet of last three is even (unicast, not multicast)
+        first_byte = int(last_three.split(':')[0], 16)
+        if first_byte % 2 == 1:
+            first_byte = (first_byte - 1) % 256
+        first_byte_hex = format(first_byte, '02X')
+        last_three = first_byte_hex + ':' + ':'.join(last_three.split(':')[1:])
+        return f"{oui}:{last_three}".lower()
 
     @staticmethod
     def __bytes_to_mac_addr(addr: bytes) -> str:
@@ -339,38 +378,108 @@ def resolve_hostname(ip_address: str):
 
 
 def get_default_interface():
+    """
+    Get the default network interface name.
+    Returns None if unable to determine, or a valid interface name.
+    """
     tables = NetworkingTables()
     route = tables.get_default_route()
     if not route:
         return None
+    
     iface = route.interface
-    if iface and re.match(r'^\d+\.\d+\.\d+\.\d+$', iface):
-        resolved = None
-        if get_windows_if_list:
-            try:
-                for entry in get_windows_if_list():
-                    ips = entry.get('ips') or entry.get('ipv4') or []
-                    if not ips:
-                        legacy_ip = entry.get('ip')
-                        if legacy_ip:
-                            ips = [legacy_ip]
-                    if isinstance(ips, str):
-                        ips = [ips]
-                    ips = [str(ip) for ip in ips if ip]
-                    if iface in ips:
-                        resolved = entry.get('name') or entry.get('description')
-                        break
-            except Exception:
-                resolved = None
-        if not resolved:
-            try:
-                _, _, iface_name = conf.route.route(route.gateway or '0.0.0.0')
+    if not iface:
+        return None
+    
+    # If interface is already a name (not an IP), try to validate it
+    if not re.match(r'^\d+\.\d+\.\d+\.\d+$', iface):
+        # It's likely already a name, but verify it exists
+        try:
+            # Try to get MAC address to validate interface exists
+            get_if_hwaddr(iface)
+            return iface
+        except Exception:
+            # Interface name doesn't exist, try to resolve from gateway
+            pass
+    
+    # Interface is an IP address, need to resolve to name
+    resolved = None
+    
+    # First, try to resolve using Windows interface list
+    if get_windows_if_list:
+        try:
+            for entry in get_windows_if_list():
+                ips = entry.get('ips') or entry.get('ipv4') or []
+                if not ips:
+                    legacy_ip = entry.get('ip')
+                    if legacy_ip:
+                        ips = [legacy_ip]
+                if isinstance(ips, str):
+                    ips = [ips]
+                ips = [str(ip) for ip in ips if ip]
+                
+                # Check if the interface IP matches
+                if iface in ips:
+                    resolved = entry.get('name') or entry.get('description')
+                    if resolved:
+                        # Validate the resolved name works
+                        try:
+                            get_if_hwaddr(resolved)
+                            return resolved
+                        except Exception:
+                            resolved = None
+                            continue
+        except Exception:
+            pass
+    
+    # Second, try using Scapy's route resolution
+    if not resolved:
+        try:
+            # Try to get interface from route to gateway
+            if route.gateway and route.gateway != '0.0.0.0':
+                _, _, iface_name = conf.route.route(route.gateway)
                 if iface_name:
-                    resolved = iface_name
-            except Exception:
-                resolved = None
-        if resolved:
-            return resolved
+                    try:
+                        get_if_hwaddr(iface_name)
+                        return iface_name
+                    except Exception:
+                        pass
+            
+            # Try default route
+            _, _, iface_name = conf.route.route('0.0.0.0')
+            if iface_name:
+                try:
+                    get_if_hwaddr(iface_name)
+                    return iface_name
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    
+    # Last resort: try to find any interface that has the gateway IP
+    if route.gateway and route.gateway != '0.0.0.0' and get_windows_if_list:
+        try:
+            for entry in get_windows_if_list():
+                ips = entry.get('ips') or entry.get('ipv4') or []
+                if isinstance(ips, str):
+                    ips = [ips]
+                ips = [str(ip) for ip in ips if ip]
+                if route.gateway in ips:
+                    resolved = entry.get('name') or entry.get('description')
+                    if resolved:
+                        try:
+                            get_if_hwaddr(resolved)
+                            return resolved
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    
+    # If we still have an IP address, it's not a valid interface name
+    if re.match(r'^\d+\.\d+\.\d+\.\d+$', iface):
+        return None
+    
+    # Return the original value if it's not an IP (might be a name)
     return iface
 
 
@@ -380,20 +489,39 @@ def discover_hosts(*, interface: str, cidr: str = None, timeout: int = 2):
     Returns a list of dicts with keys: ip, mac, hostname.
     """
     results = {}
+    
+    # Parse CIDR early if provided
+    network_obj = None
+    network_cidr = None
+    if cidr:
+        try:
+            network_obj = IPv4Network(cidr, strict=False)
+            network_cidr = str(network_obj)
+        except ValueError as e:
+            print(f'[!] Invalid CIDR format "{cidr}": {e}')
+            return []
 
     def _register_entry(ip: str, mac: str):
         if mac in ('ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00'):
             return
+        # If CIDR is specified, filter ARP entries to that network
+        if network_obj:
+            try:
+                addr = ip_address(ip)
+                if addr not in network_obj or addr == network_obj.network_address or addr == network_obj.broadcast_address:
+                    return
+            except ValueError:
+                return
         entry = results.setdefault(ip, {'ip': ip, 'mac': None, 'hostname': None, 'sources': set()})
         if mac:
             entry['mac'] = mac.lower()
         entry['sources'].add('passive')
 
+    # Collect passive ARP table entries (filtered by CIDR if provided)
     tables = NetworkingTables()
     for entry in tables.arp_table:
         _register_entry(entry['ip_address'], entry['hw_address'])
 
-    network_cidr = cidr
     if not network_cidr:
         iface_addr = None
         netmask = None
@@ -447,36 +575,49 @@ def discover_hosts(*, interface: str, cidr: str = None, timeout: int = 2):
         if iface_addr and netmask:
             try:
                 network_cidr = str(ip_interface(f"{iface_addr}/{netmask}").network)
+                network_obj = IPv4Network(network_cidr, strict=False)
             except ValueError:
                 network_cidr = None
+                network_obj = None
 
+    # Perform active scanning if we have a network CIDR
     if network_cidr:
         def _active_scan():
             try:
-                ans, _ = arping(network_cidr, iface=interface, timeout=timeout, verbose=False)
+                print(f'[*] Actively scanning {network_cidr} (timeout: {timeout}s)...')
+                ans, unans = arping(network_cidr, iface=interface, timeout=timeout, verbose=False)
+                active_count = 0
                 for _, pkt in ans:
                     ip = pkt.psrc
                     mac = pkt.hwsrc
+                    # Filter to network if CIDR was provided
+                    if network_obj:
+                        try:
+                            addr = ip_address(ip)
+                            if addr not in network_obj or addr == network_obj.network_address or addr == network_obj.broadcast_address:
+                                continue
+                        except ValueError:
+                            continue
                     entry = results.setdefault(ip, {'ip': ip, 'mac': None, 'hostname': None, 'sources': set()})
                     entry['mac'] = mac.lower()
                     entry['sources'].add('active')
-            except Exception:
-                pass
+                    active_count += 1
+                if active_count > 0:
+                    print(f'[+] Active scan found {active_count} host(s)')
+                elif cidr:  # Only warn if CIDR was explicitly provided
+                    print(f'[!] Active scan of {network_cidr} found no responsive hosts')
+            except Exception as e:
+                if cidr:  # Only warn if CIDR was explicitly provided
+                    print(f'[!] Active scan error: {e}')
 
         scan_thread = threading.Thread(target=_active_scan, name='HostDiscover', daemon=True)
         scan_thread.start()
-        scan_thread.join(timeout + 1)
+        scan_thread.join(timeout + 2)  # Give a bit more time for thread completion
 
+    # Resolve hostnames
     for entry in results.values():
         if not entry['hostname']:
             entry['hostname'] = resolve_hostname(entry['ip'])
-
-    network_obj = None
-    if network_cidr:
-        try:
-            network_obj = IPv4Network(network_cidr, strict=False)
-        except ValueError:
-            network_obj = None
 
     hosts = []
     for ip, info in sorted(results.items()):

