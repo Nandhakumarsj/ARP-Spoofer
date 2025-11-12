@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Windows-compatible replacement for packets.py
+# Based on EONRaider/Arp-Spoofer original with AF_PACKET removed
 # Requires: scapy (for get_if_hwaddr and getmacbyip) and running with Npcap+Administrator for active queries
 
 __author__ = 'Adapted from EONRaider'
