@@ -7,16 +7,28 @@ __author__ = 'Adapted from EONRaider'
 
 from csv import DictReader
 from random import choices
-from socket import inet_ntop, AF_INET
+from socket import inet_ntop, AF_INET, gethostbyaddr
 from struct import pack
-from time import sleep
 from types import SimpleNamespace
+from ipaddress import ip_interface, ip_address, IPv4Network
 import re
 import subprocess
 import sys
+import threading
 
 # scapy helpers (used only for interface MAC lookup / getmacbyip fallback)
-from scapy.all import get_if_hwaddr, getmacbyip, conf
+from scapy.all import (
+    get_if_hwaddr,
+    getmacbyip,
+    conf,
+    arping,
+    get_if_addr,
+)
+
+try:
+    from scapy.arch.windows import get_windows_if_list
+except ImportError:
+    get_windows_if_list = None
 
 from protocols import ARP, Ethernet, Packet
 
@@ -316,4 +328,172 @@ class NetworkingTables(object):
                     return SimpleNamespace(interface=route['interface'], gateway=gw_ip)
 
         return None
+
+
+def resolve_hostname(ip_address: str):
+    try:
+        hostname, _, _ = gethostbyaddr(ip_address)
+        return hostname
+    except Exception:
+        return None
+
+
+def get_default_interface():
+    tables = NetworkingTables()
+    route = tables.get_default_route()
+    if not route:
+        return None
+    iface = route.interface
+    if iface and re.match(r'^\d+\.\d+\.\d+\.\d+$', iface):
+        resolved = None
+        if get_windows_if_list:
+            try:
+                for entry in get_windows_if_list():
+                    ips = entry.get('ips') or entry.get('ipv4') or []
+                    if not ips:
+                        legacy_ip = entry.get('ip')
+                        if legacy_ip:
+                            ips = [legacy_ip]
+                    if isinstance(ips, str):
+                        ips = [ips]
+                    ips = [str(ip) for ip in ips if ip]
+                    if iface in ips:
+                        resolved = entry.get('name') or entry.get('description')
+                        break
+            except Exception:
+                resolved = None
+        if not resolved:
+            try:
+                _, _, iface_name = conf.route.route(route.gateway or '0.0.0.0')
+                if iface_name:
+                    resolved = iface_name
+            except Exception:
+                resolved = None
+        if resolved:
+            return resolved
+    return iface
+
+
+def discover_hosts(*, interface: str, cidr: str = None, timeout: int = 2):
+    """
+    Discover hosts reachable on the local network segment.
+    Returns a list of dicts with keys: ip, mac, hostname.
+    """
+    results = {}
+
+    def _register_entry(ip: str, mac: str):
+        if mac in ('ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00'):
+            return
+        entry = results.setdefault(ip, {'ip': ip, 'mac': None, 'hostname': None, 'sources': set()})
+        if mac:
+            entry['mac'] = mac.lower()
+        entry['sources'].add('passive')
+
+    tables = NetworkingTables()
+    for entry in tables.arp_table:
+        _register_entry(entry['ip_address'], entry['hw_address'])
+
+    network_cidr = cidr
+    if not network_cidr:
+        iface_addr = None
+        netmask = None
+        try:
+            iface_addr = get_if_addr(interface)
+        except Exception:
+            iface_addr = None
+
+        iface_obj = None
+        try:
+            iface_obj = conf.ifaces[interface]
+        except Exception:
+            try:
+                iface_obj = conf.ifaces.dev_from_name(interface)
+            except Exception:
+                iface_obj = None
+
+        if iface_obj:
+            netmask = getattr(iface_obj, 'netmask', None)
+            if not iface_addr:
+                iface_addr = getattr(iface_obj, 'ip', None)
+
+        if not netmask and get_windows_if_list:
+            try:
+                interface_lower = interface.lower() if isinstance(interface, str) else ''
+                for entry in get_windows_if_list():
+                    name = (entry.get('name') or '').lower()
+                    description = (entry.get('description') or '').lower()
+                    ips = entry.get('ips') or entry.get('ipv4') or []
+                    if isinstance(ips, str):
+                        ips = [ips]
+                    legacy_ip = entry.get('ip')
+                    if legacy_ip:
+                        ips = list(ips) + [legacy_ip]
+                    ips = [str(ip) for ip in ips if ip]
+
+                    match_by_name = interface_lower in (name, description)
+                    match_by_ip = isinstance(interface, str) and interface in ips
+
+                    if match_by_name or match_by_ip:
+                        win_netmask = entry.get('netmask') or entry.get('mask')
+                        if win_netmask:
+                            netmask = win_netmask
+                        if not iface_addr:
+                            if ips:
+                                iface_addr = next((ip for ip in ips if isinstance(ip, str)), None)
+                        break
+            except Exception:
+                netmask = None
+
+        if iface_addr and netmask:
+            try:
+                network_cidr = str(ip_interface(f"{iface_addr}/{netmask}").network)
+            except ValueError:
+                network_cidr = None
+
+    if network_cidr:
+        def _active_scan():
+            try:
+                ans, _ = arping(network_cidr, iface=interface, timeout=timeout, verbose=False)
+                for _, pkt in ans:
+                    ip = pkt.psrc
+                    mac = pkt.hwsrc
+                    entry = results.setdefault(ip, {'ip': ip, 'mac': None, 'hostname': None, 'sources': set()})
+                    entry['mac'] = mac.lower()
+                    entry['sources'].add('active')
+            except Exception:
+                pass
+
+        scan_thread = threading.Thread(target=_active_scan, name='HostDiscover', daemon=True)
+        scan_thread.start()
+        scan_thread.join(timeout + 1)
+
+    for entry in results.values():
+        if not entry['hostname']:
+            entry['hostname'] = resolve_hostname(entry['ip'])
+
+    network_obj = None
+    if network_cidr:
+        try:
+            network_obj = IPv4Network(network_cidr, strict=False)
+        except ValueError:
+            network_obj = None
+
+    hosts = []
+    for ip, info in sorted(results.items()):
+        try:
+            addr = ip_address(ip)
+        except ValueError:
+            continue
+        if addr.is_multicast or addr.is_unspecified or addr.is_loopback or addr.is_reserved:
+            continue
+        if network_obj:
+            if addr not in network_obj or addr == network_obj.network_address or addr == network_obj.broadcast_address:
+                continue
+        hosts.append({
+            'ip': ip,
+            'mac': info.get('mac'),
+            'hostname': info.get('hostname'),
+            'sources': ','.join(sorted(info['sources'])) if info.get('sources') else '',
+        })
+    return hosts
 

