@@ -1,0 +1,25 @@
+[project]
+name = "arp-spoof"
+version = "0.1.0"
+description = "ARP Spoofing with MitM and Session Hijacking"
+authors = [
+    {name = "NandhakumarSJ",email = "excelnandhu@gmail.com"}
+]
+license = {text = "Open Source"}
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "scapy (>=2.6.1,<3.0.0)",
+    "pyqt5 (>=5.15.11,<6.0.0)",
+    "qtawesome (>=1.4.0,<2.0.0)"
+]
+
+[dependency-groups]
+dev = [
+    "autopep8 (>=2.3.2,<3.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
