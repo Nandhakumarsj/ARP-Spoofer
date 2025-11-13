@@ -84,12 +84,15 @@ class Spoofer(object):
     def __init__(self, *, interface: str, attackermac: str,
                  gatewaymac: str, gatewayip: str, targetmac: str, targetip: str,
                  interval: float, disassociate: bool, ipforward: bool,
-                 stealth: bool = False, jitter: float = 0.0, min_interval: float = None):
+                 stealth: bool = False, jitter: float = 0.0, min_interval: float = None,
+                 prompt_confirm: bool = True, use_signal_handlers: bool = True):
         self.__interval = interval
         self.__min_interval = min_interval or (interval * 0.5)
         self.__jitter = jitter
         self.__stealth = stealth
         self.__ipv4_forwarding = ipforward
+        self.prompt_confirm = prompt_confirm
+        self.use_signal_handlers = use_signal_handlers
         self.__arp = ARPSetupProxy(interface, attackermac, gatewaymac,
                                    gatewayip, targetmac, targetip,
                                    disassociate, stealth)
